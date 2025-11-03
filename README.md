@@ -1,1 +1,1 @@
-# AIGuru
+# WriteWise
