@@ -5,6 +5,7 @@ import uuid
 import json
 import firebase_client
 from datetime import datetime
+from typing import List, Optional
 
 st.set_page_config(page_title="Write Wise - AI Content Generator", layout="wide", page_icon="✍️")
 
@@ -61,6 +62,8 @@ if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 if "do_not_store" not in st.session_state:
     st.session_state.do_not_store = False
+if "private_session_enabled" not in st.session_state:
+    st.session_state.private_session_enabled = st.session_state.do_not_store
 if "current_page" not in st.session_state:
     st.session_state.current_page = "generator"
 if "selected_template" not in st.session_state:
@@ -75,6 +78,57 @@ if "section_results" not in st.session_state:
     st.session_state.section_results = {}
 if "generation_mode" not in st.session_state:
     st.session_state.generation_mode = None
+if "persistent_session_token" not in st.session_state:
+    st.session_state.persistent_session_token = None
+if "persistent_session_checked" not in st.session_state:
+    st.session_state.persistent_session_checked = False
+if "structure_selection_message" not in st.session_state:
+    st.session_state.structure_selection_message = None
+
+def _get_query_param(name: str) -> Optional[str]:
+    value = st.query_params.get(name)
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
+def _set_query_param(name: str, value: str) -> None:
+    try:
+        st.query_params[name] = value
+    except Exception:
+        pass
+
+
+def _remove_query_param(name: str) -> None:
+    try:
+        del st.query_params[name]
+    except Exception:
+        pass
+
+
+if not st.session_state.user and not st.session_state.persistent_session_checked:
+    session_token = _get_query_param("session")
+    if session_token:
+        restored_user, message = firebase_client.resume_session(session_token)
+        warning_msg = firebase_client.pop_last_error()
+        if warning_msg:
+            st.warning(warning_msg)
+        if restored_user:
+            st.session_state.user = restored_user
+            st.session_state.persistent_session_token = session_token
+        else:
+            _remove_query_param("session")
+            st.session_state.persistent_session_token = None
+            if message:
+                st.warning(f"Session refresh required: {message}")
+    st.session_state.persistent_session_checked = True
+
+
+def _surface_firebase_warning() -> None:
+    """Display any pending Firebase warning to the user."""
+    message = firebase_client.pop_last_error()
+    if message:
+        st.warning(message)
 
 # ------------------------------
 # Example Structure Templates
@@ -175,8 +229,31 @@ def show_auth_page():
                     st.error("Please provide both email and password")
                 else:
                     user, message = firebase_client.authenticate_user(email, password)
-                    if user:
+                    if user and isinstance(user, dict):
                         st.session_state.user = user
+                        if st.session_state.persistent_session_token:
+                            firebase_client.delete_persistent_session(st.session_state.persistent_session_token)
+                            residual_warning = firebase_client.pop_last_error()
+                            if residual_warning:
+                                st.warning(residual_warning)
+                        st.session_state.persistent_session_token = None
+
+                        refresh_token = user.get("refresh_token")
+                        session_token, session_message = firebase_client.create_persistent_session(
+                            user.get("uid"),
+                            refresh_token,
+                            metadata={"email": user.get("email")}
+                        ) if refresh_token else (None, "")
+                        warning_msg = firebase_client.pop_last_error()
+                        if warning_msg:
+                            st.warning(warning_msg)
+
+                        if session_token:
+                            st.session_state.persistent_session_token = session_token
+                            _set_query_param("session", session_token)
+                        elif session_message:
+                            st.info(f"Login succeeded, but session won't persist: {session_message}")
+
                         st.success(f"Welcome back! {message}")
                         st.rerun()
                     else:
@@ -184,6 +261,14 @@ def show_auth_page():
 
         st.markdown("---")
         if st.button("Continue as Guest"):
+            if st.session_state.persistent_session_token:
+                firebase_client.delete_persistent_session(st.session_state.persistent_session_token)
+                warning_msg = firebase_client.pop_last_error()
+                if warning_msg:
+                    st.warning(warning_msg)
+            st.session_state.persistent_session_token = None
+            _remove_query_param("session")
+            st.session_state.structure_selection_message = None
             st.session_state.user = {"guest": True, "email": "guest"}
             st.session_state.do_not_store = True
             st.info("Continuing as guest - your sessions will not be saved")
@@ -246,6 +331,7 @@ def show_history_page():
             st.rerun()
 
     sessions = firebase_client.list_sessions(user_id, search_term=search_term or None)
+    _surface_firebase_warning()
 
     if not sessions:
         st.info("No saved sessions yet. Generate content to build your history.")
@@ -277,6 +363,7 @@ def show_history_page():
             st.caption(f"Messages: {message_count}")
 
             messages = firebase_client.get_messages(session_id, user_id=user_id)
+            _surface_firebase_warning()
             if not messages:
                 st.info("No messages stored for this session.")
             else:
@@ -324,6 +411,22 @@ def show_history_page():
 def show_template_page():
     st.title("📋 Structure Builder")
     st.markdown("Define your document structure and let AI generate content for each section!")
+
+    if st.session_state.structure_selection_message:
+        st.success(st.session_state.structure_selection_message)
+
+    def _load_structure_into_generator(template_label: str, sections: List[str], *, main_topic: Optional[str] = None, description: str = "") -> None:
+        """Persist the selected structure and cue the user to generate content."""
+        st.session_state.selected_template = template_label or "Custom Structure"
+        st.session_state.custom_sections = sections.copy()
+        st.session_state.main_topic = main_topic or template_label or "Custom Structure"
+        st.session_state.additional_context = description
+        st.session_state.section_results = {}
+        st.session_state.structure_selection_message = (
+            f"Structure '{st.session_state.selected_template}' selected. Open the Generator tab to start creating content."
+        )
+        st.session_state.structured_prompt_input = ""
+        st.rerun()
     
     tab1, tab2, tab3 = st.tabs(["Use Example Structures", "Create Custom Structure", "My Saved Templates"])
     
@@ -336,13 +439,9 @@ def show_template_page():
                 st.markdown("**Sections:**")
                 for i, section in enumerate(sections, 1):
                     st.markdown(f"{i}. {section}")
-                
-                if st.button(f"Use {structure_name} Structure", key=f"use_{structure_name}"):
-                    st.session_state.selected_template = structure_name
-                    st.session_state.custom_sections = sections.copy()
-                    st.session_state.current_page = "generator"
-                    st.success(f"Structure '{structure_name}' loaded! Redirecting to generator...")
-                    st.rerun()
+
+                if st.button(f"Open \"{structure_name}\" in Generator", key=f"open_{structure_name}"):
+                    _load_structure_into_generator(structure_name, sections, main_topic=structure_name)
     
     with tab2:
         st.subheader("Create Your Own Document Structure")
@@ -414,14 +513,8 @@ def show_template_page():
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            if st.button("✅ Use This Structure", type="primary", disabled=not custom_sections or not main_topic):
-                st.session_state.selected_template = main_topic or "Custom Structure"
-                st.session_state.custom_sections = custom_sections
-                st.session_state.main_topic = main_topic
-                st.session_state.additional_context = description
-                st.session_state.current_page = "generator"
-                st.success("Custom structure created! Redirecting to generator...")
-                st.rerun()
+            if st.button("🚀 Open in Generator", type="primary", disabled=not custom_sections or not main_topic):
+                _load_structure_into_generator(main_topic or "Custom Structure", custom_sections, main_topic=main_topic, description=description)
         
         with col2:
             if st.button("💾 Save Template", disabled=not custom_sections or not main_topic):
@@ -436,8 +529,10 @@ def show_template_page():
                     )
                     if success:
                         st.success(f"✅ {message}")
+                        _surface_firebase_warning()
                     else:
                         st.error(f"❌ {message}")
+                        _surface_firebase_warning()
                 elif not st.session_state.user or st.session_state.user.get("guest"):
                     st.warning("Please login to save templates")
                 else:
@@ -456,8 +551,10 @@ def show_template_page():
                     )
                     if success:
                         st.success(f"✅ {message} - Shared publicly!")
+                        _surface_firebase_warning()
                     else:
                         st.error(f"❌ {message}")
+                        _surface_firebase_warning()
                 elif not st.session_state.user or st.session_state.user.get("guest"):
                     st.warning("Please login to save templates")
                 else:
@@ -494,6 +591,7 @@ def show_template_page():
 
         include_public = any(option in selected_visibility for option in ("Public", "Community"))
         templates = firebase_client.list_templates(user_id, include_public=include_public)
+        _surface_firebase_warning()
 
         if not templates:
             st.info("No saved templates found. Create one in the 'Create Custom Structure' tab!")
@@ -587,13 +685,7 @@ def show_template_page():
                 
                 with action_cols[0]:
                     if st.button(f"✅ Use Template", key=f"use_template_{template_id}"):
-                        st.session_state.selected_template = template_name
-                        st.session_state.custom_sections = sections.copy()
-                        st.session_state.main_topic = template_name
-                        st.session_state.additional_context = description
-                        st.session_state.current_page = "generator"
-                        st.success(f"Template '{template_name}' loaded! Redirecting to generator...")
-                        st.rerun()
+                        _load_structure_into_generator(template_name, sections, main_topic=template_name, description=description)
 
                 with action_cols[1]:
                     st.download_button(
@@ -609,9 +701,11 @@ def show_template_page():
                         if st.button(f"🗑️ Delete", key=f"delete_template_{template_id}"):
                             if firebase_client.delete_template(template_id, user_id):
                                 st.success(f"Template '{template_name}' deleted!")
+                                _surface_firebase_warning()
                                 st.rerun()
                             else:
                                 st.error("Failed to delete template")
+                                _surface_firebase_warning()
 
                     with action_cols[3]:
                         new_visibility = "🔒 Make Private" if is_public else "🌐 Make Public"
@@ -623,9 +717,11 @@ def show_template_page():
                             )
                             if success:
                                 st.success(message)
+                                _surface_firebase_warning()
                                 st.rerun()
                             else:
                                 st.error(message)
+                                _surface_firebase_warning()
 
                     with st.expander("✏️ Edit Template", expanded=False):
                         sections_text = "\n".join(sections)
@@ -660,9 +756,11 @@ def show_template_page():
                                     )
                                     if success:
                                         st.success(message)
+                                        _surface_firebase_warning()
                                         st.rerun()
                                     else:
                                         st.error(message)
+                                        _surface_firebase_warning()
 
 # ------------------------------
 # Main Generator Page
@@ -681,6 +779,14 @@ def show_generator_page():
                 st.caption(f"👤 Logged in as: {st.session_state.user.get('email', 'User')}")
     with col2:
         if st.button("🚪 Logout" if st.session_state.user and not st.session_state.user.get("guest") else "🏠 Exit Guest"):
+            if st.session_state.persistent_session_token:
+                firebase_client.delete_persistent_session(st.session_state.persistent_session_token)
+                warning_msg = firebase_client.pop_last_error()
+                if warning_msg:
+                    st.warning(warning_msg)
+            st.session_state.persistent_session_token = None
+            _remove_query_param("session")
+            st.session_state.structure_selection_message = None
             st.session_state.user = None
             st.session_state.session_id = str(uuid.uuid4())
             st.rerun()
@@ -701,6 +807,8 @@ def show_generator_page():
             st.session_state.custom_sections = None
             st.session_state.main_topic = None
             st.session_state.additional_context = None
+            st.session_state.structure_selection_message = None
+            st.session_state.pop("structured_prompt_input", None)
             st.rerun()
     
     # Structure-based input
@@ -732,9 +840,18 @@ def show_generator_page():
                 height=80,
                 key="context_input"
             )
+
+        custom_prompt_input = st.text_area(
+            "Enter your prompt:",
+            height=150,
+            key="structured_prompt_input",
+            placeholder="Describe the angle, audience, or specifics you want reflected in the content..."
+        )
         
         # Build structured prompt
         user_prompt = f"Topic: {main_topic}\n\n"
+        if custom_prompt_input:
+            user_prompt += f"Prompt: {custom_prompt_input}\n\n"
         if additional_context:
             user_prompt += f"Context: {additional_context}\n\n"
         user_prompt += "Please generate comprehensive content for the following document structure:\n\n"

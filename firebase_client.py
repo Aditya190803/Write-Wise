@@ -3,7 +3,7 @@ import time
 import uuid
 import json
 from urllib.parse import urlencode
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Callable
 
 try:
     import requests
@@ -47,12 +47,13 @@ class FirebaseChildSnapshot(FirebaseSnapshot):
 class FirebaseApplicationAdapter:
     """Adapter to provide Pyrebase-like interface for firebase.FirebaseApplication."""
 
-    def __init__(self, app: Any, path: Optional[List[str]] = None):
+    def __init__(self, app: Any, path: Optional[List[str]] = None, error_callback: Optional[Callable[[str], None]] = None):
         self._app = app
         self._path = path or []
+        self._error_callback = error_callback
 
     def child(self, name: str) -> "FirebaseApplicationAdapter":
-        return FirebaseApplicationAdapter(self._app, self._path + [name])
+        return FirebaseApplicationAdapter(self._app, self._path + [name], self._error_callback)
 
     def set(self, data: Any) -> None:
         parent_path, key = self._parent_path_and_key()
@@ -60,6 +61,9 @@ class FirebaseApplicationAdapter:
             self._app.put(parent_path, key, data)
         except Exception as exc:
             if self._handle_http_error(exc, action="set", path=self._full_path()):
+                return
+            if requests_exceptions and isinstance(exc, requests_exceptions.RequestException):
+                self._emit_error(f"Firebase request failed while writing {self._full_path()}: {exc}")
                 return
             raise
 
@@ -85,6 +89,9 @@ class FirebaseApplicationAdapter:
                             return
                         raise
             if self._handle_http_error(exc, action="patch", path=self._full_path()):
+                return
+            if requests_exceptions and isinstance(exc, requests_exceptions.RequestException):
+                self._emit_error(f"Firebase request failed while updating {self._full_path()}: {exc}")
                 return
             raise
 
@@ -123,6 +130,9 @@ class FirebaseApplicationAdapter:
                 response = getattr(exc, "response", None)
                 if response is None or response.status_code == 404:
                     return None
+            if requests_exceptions and isinstance(exc, requests_exceptions.RequestException):
+                self._emit_error(f"Firebase request failed while reading {path}: {exc}")
+                return None
             raise
 
     def _handle_http_error(self, exc: Exception, action: str, path: str) -> bool:
@@ -131,9 +141,13 @@ class FirebaseApplicationAdapter:
         response = getattr(exc, "response", None)
         status_code = getattr(response, "status_code", None)
         if status_code in {401, 403, 404}:
-            print(f"Firebase warning: {action} at {path} returned HTTP {status_code}. Operation skipped.")
+            self._emit_error(f"Firebase warning: {action} at {path} returned HTTP {status_code}. Operation skipped.")
             return True
         return False
+
+    def _emit_error(self, message: str) -> None:
+        if self._error_callback:
+            self._error_callback(message)
 
 
 class FirebaseClient:
@@ -154,6 +168,7 @@ class FirebaseClient:
         self._db = db
         self._auth = auth
         self._initialized = self._db is not None
+        self._last_error: Optional[str] = None
 
         if auto_initialize and not self._initialized:
             self._initialize_firebase()
@@ -165,26 +180,28 @@ class FirebaseClient:
     def _initialize_firebase(self):
         """Initialize Firebase using the firebase (python-firebase) package."""
         if not self.api_key or not self.database_url:
+            self._record_error("Firebase configuration is incomplete. Please provide API key and database URL.")
             return
 
         placeholder_tokens = {"your-project", "your_firebase", "your-firebase", "<"}
         target_strings = [self.api_key or "", self.database_url or "", self.project_id or ""]
         if any(any(token in value for token in placeholder_tokens) for value in target_strings):
-            print("Firebase initialization skipped: placeholder configuration detected.")
+            self._record_error("Firebase initialization skipped: placeholder configuration detected.")
             self._initialized = False
             return
 
         if not firebase_lib:
-            print("Firebase initialization failed: 'firebase' package not installed.")
+            self._record_error("Firebase initialization failed: 'firebase' package not installed.")
             self._initialized = False
             return
 
         try:
             firebase_app = firebase_lib.FirebaseApplication(self.database_url, None)
-            self._db = FirebaseApplicationAdapter(firebase_app)
+            self._db = FirebaseApplicationAdapter(firebase_app, error_callback=self._record_error)
             self._initialized = True
+            self._record_error(None)
         except Exception as e:
-            print(f"Firebase initialization failed: {e}")
+            self._record_error(f"Firebase initialization failed: {e}")
             self._initialized = False
 
     def is_configured(self) -> bool:
@@ -218,6 +235,124 @@ class FirebaseClient:
             return {"error": "Request timed out while contacting Firebase."}
         except Exception as e:
             return {"error": str(e)}
+
+    def _refresh_id_token(self, refresh_token: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        if not self.api_key or not requests:
+            return None, "Firebase not configured."
+        if not refresh_token:
+            return None, "Missing refresh token."
+
+        try:
+            response = requests.post(
+                f"https://securetoken.googleapis.com/v1/token?key={self.api_key}",
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                },
+                timeout=10,
+            )
+            data = response.json()
+            if response.status_code != 200:
+                error_detail = data.get("error", {}) if isinstance(data, dict) else {}
+                if isinstance(error_detail, dict):
+                    message = error_detail.get("message") or json.dumps(error_detail)
+                else:
+                    message = str(error_detail) if error_detail else "Failed to refresh session."
+                return None, message
+            return data, "Token refreshed."
+        except requests_exceptions.Timeout:
+            return None, "Request timed out while refreshing session."
+        except Exception as exc:
+            return None, str(exc)
+
+    def create_persistent_session(self, user_id: str, refresh_token: str, metadata: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], str]:
+        if not self.is_configured():
+            return None, "Firebase not configured."
+        if not refresh_token:
+            return None, "Missing refresh token."
+
+        session_token = uuid.uuid4().hex
+        session_payload: Dict[str, Any] = {
+            "user_id": user_id,
+            "refresh_token": refresh_token,
+            "created_at": int(time.time()),
+            "updated_at": int(time.time()),
+        }
+        if metadata:
+            session_payload["metadata"] = metadata
+
+        try:
+            self._db.child("auth_sessions").child(session_token).set(session_payload)
+            self._record_error(None)
+            return session_token, "Persistent session created."
+        except Exception as exc:
+            self._record_error(f"Failed to create persistent session: {exc}")
+            return None, "Unable to create persistent session."
+
+    def resume_session(self, session_token: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        if not self.is_configured():
+            return None, "Firebase not configured."
+        if not session_token:
+            return None, "Missing session token."
+
+        record = self._db.child("auth_sessions").child(session_token).get().val()
+        if not record:
+            return None, "Session not found."
+        if not isinstance(record, dict):
+            return None, "Session data is corrupted."
+
+        refresh_token = record.get("refresh_token")
+        if not refresh_token:
+            return None, "Session missing refresh token."
+        refresh_result, message = self._refresh_id_token(refresh_token)
+        if not refresh_result:
+            return None, message or "Failed to refresh session."
+
+        user_id = refresh_result.get("user_id") or record.get("user_id")
+        if not user_id:
+            return None, "Session missing user information."
+
+        user_data = self._db.child("users").child(user_id).get().val() or {}
+        id_token = refresh_result.get("id_token")
+        if not id_token:
+            return None, "Failed to refresh authentication token."
+        new_refresh_token = refresh_result.get("refresh_token") or refresh_token
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        email = user_data.get("email") or metadata.get("email")
+        if email:
+            user_data["email"] = email
+
+        user_data.update({
+            "uid": user_id,
+            "id_token": id_token,
+            "refresh_token": new_refresh_token,
+            "last_login": int(time.time()),
+        })
+
+        try:
+            update_payload = {
+                "refresh_token": new_refresh_token,
+                "updated_at": int(time.time()),
+                "expires_in": refresh_result.get("expires_in"),
+            }
+            self._db.child("auth_sessions").child(session_token).update(update_payload)
+            self._db.child("users").child(user_id).update({"last_login": int(time.time())})
+            self._record_error(None)
+        except Exception as exc:
+            self._record_error(f"Failed to update session metadata: {exc}")
+
+        return user_data, "Session restored."
+
+    def delete_persistent_session(self, session_token: Optional[str]) -> bool:
+        if not self.is_configured() or not session_token:
+            return False
+        try:
+            self._db.child("auth_sessions").child(session_token).remove()
+            self._record_error(None)
+            return True
+        except Exception as exc:
+            self._record_error(f"Failed to delete session token: {exc}")
+            return False
 
     def register_user(self, email: str, password: str) -> Tuple[bool, str]:
         if not self.is_configured():
@@ -267,9 +402,17 @@ class FirebaseClient:
 
         user_id = result.get("localId")
         id_token = result.get("idToken")
-        user_data = self._db.child("users").child(user_id).get().val() or {"email": email.lower()}
+        refresh_token = result.get("refreshToken")
+        user_data = self._db.child("users").child(user_id).get().val() or {}
+        
+        # Ensure email is always present
+        if "email" not in user_data:
+            user_data["email"] = email.lower()
+        
         user_data.update({"uid": user_id, "id_token": id_token, "last_login": int(time.time())})
-        self._db.child("users").child(user_id).update({"last_login": int(time.time())})
+        if refresh_token:
+            user_data["refresh_token"] = refresh_token
+        self._db.child("users").child(user_id).update({"last_login": int(time.time()), "email": user_data["email"]})
         return user_data, "Authenticated successfully."
 
     def authenticate_with_google(self, token_payload: Any) -> Tuple[Optional[Dict[str, Any]], str]:
@@ -323,7 +466,7 @@ class FirebaseClient:
             self._db.child("users").child(user_id).update(user_data)
             return user_data, "Authenticated with Google."
         except Exception as exc:
-            print(f"Error processing Google sign-in result: {exc}")
+            self._record_error(f"Error processing Google sign-in result: {exc}")
             return None, "Google authentication failed."
 
     # ---------------------------------------------------------
@@ -378,7 +521,7 @@ class FirebaseClient:
             data = response.json()
             return data.get("authUri", ""), data.get("sessionId"), None
         except Exception as exc:
-            print(f"Failed to create Google auth URI: {exc}")
+            self._record_error(f"Failed to create Google auth URI: {exc}")
             return "", None, str(exc)
 
     def exchange_code_for_token(self, code: str, redirect_uri: str, session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -402,7 +545,7 @@ class FirebaseClient:
                     return None
                 return response.json()
             except Exception as exc:
-                print(f"Failed to exchange code via Google OAuth: {exc}")
+                self._record_error(f"Failed to exchange code via Google OAuth: {exc}")
                 return None
 
         try:
@@ -425,11 +568,11 @@ class FirebaseClient:
                 timeout=10,
             )
             if response.status_code != 200:
-                print(f"signInWithIdp failed: {response.text}")
+                self._record_error(f"signInWithIdp failed: {response.text}")
                 return None
             return response.json()
         except Exception as exc:
-            print(f"Failed to exchange code via Identity Toolkit: {exc}")
+            self._record_error(f"Failed to exchange code via Identity Toolkit: {exc}")
             return None
 
     # ---------------------------------------------------------
@@ -476,9 +619,10 @@ class FirebaseClient:
                         msgs.append(msg_val)
             
             msgs.sort(key=lambda x: x.get("timestamp", 0))
+            self._record_error(None)
             return msgs[:limit]
         except Exception as e:
-            print(f"Error getting messages: {e}")
+            self._record_error(f"Error getting messages: {e}")
             return []
 
     def _update_session_metadata(self, session_id: str, user_id: Optional[str], 
@@ -491,26 +635,33 @@ class FirebaseClient:
             session_path = self._db.child("sessions").child(user_id).child(session_id)
             existing = session_path.get()
             
-            session_data = {
-                "session_id": session_id,
-                "user_id": user_id,
-                "updated_at": timestamp,
-            }
-            
             if existing.val():
-                # Update existing session
-                session_data["created_at"] = existing.val().get("created_at", timestamp)
-                session_data["title"] = existing.val().get("title", metadata.get("title", "Untitled") if metadata else "Untitled")
-                session_data["message_count"] = existing.val().get("message_count", 0) + 1
+                # Update existing session - only update specific fields to avoid race conditions
+                update_data = {
+                    "updated_at": timestamp,
+                }
+                # Only update title if metadata has a new title
+                if metadata and "title" in metadata:
+                    update_data["title"] = metadata["title"]
+                
+                # Get current message count and increment it
+                current_count = existing.val().get("message_count", 0)
+                update_data["message_count"] = current_count + 1
+                
+                session_path.update(update_data)
             else:
                 # Create new session
-                session_data["created_at"] = timestamp
-                session_data["title"] = metadata.get("title", "Untitled") if metadata else "Untitled"
-                session_data["message_count"] = 1
-            
-            session_path.set(session_data)
+                session_data = {
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "created_at": timestamp,
+                    "updated_at": timestamp,
+                    "title": metadata.get("title", "Untitled") if metadata else "Untitled",
+                    "message_count": 1
+                }
+                session_path.set(session_data)
         except Exception as e:
-            print(f"Error updating session metadata: {e}")
+            self._record_error(f"Error updating session metadata: {e}")
 
     # ---------------------------------------------------------
     # Session Management
@@ -541,9 +692,10 @@ class FirebaseClient:
             
             # Sort by updated_at (most recent first)
             sessions.sort(key=lambda x: x.get("updated_at", 0), reverse=True)
+            self._record_error(None)
             return sessions
         except Exception as e:
-            print(f"Error listing sessions: {e}")
+            self._record_error(f"Error listing sessions: {e}")
             return []
 
     def export_history(self, user_id: str) -> str:
@@ -580,7 +732,7 @@ class FirebaseClient:
             
             return json.dumps(export_data, indent=2)
         except Exception as e:
-            print(f"Error exporting history: {e}")
+            self._record_error(f"Error exporting history: {e}")
             return json.dumps({"error": str(e)}, indent=2)
 
     def delete_session(self, session_id: str, user_id: str) -> bool:
@@ -602,9 +754,10 @@ class FirebaseClient:
                     if msg_val.get("session_id") == session_id and msg_val.get("user_id") == user_id:
                         self._db.child("messages").child(m.key()).remove()
             
+            self._record_error(None)
             return True
         except Exception as e:
-            print(f"Error deleting session: {e}")
+            self._record_error(f"Error deleting session: {e}")
             return False
 
     # ---------------------------------------------------------
@@ -641,9 +794,10 @@ class FirebaseClient:
             if is_public:
                 self._db.child("public_templates").child(template_id).set(template_data)
             
+            self._record_error(None)
             return True, f"Template '{template_name}' saved successfully"
         except Exception as e:
-            print(f"Error saving template: {e}")
+            self._record_error(f"Error saving template: {e}")
             return False, f"Failed to save template: {str(e)}"
 
     def list_templates(self, user_id: str, include_public: bool = True) -> List[Dict[str, Any]]:
@@ -676,9 +830,10 @@ class FirebaseClient:
             
             # Sort by updated_at (most recent first)
             templates.sort(key=lambda x: x.get("updated_at", 0), reverse=True)
+            self._record_error(None)
             return templates
         except Exception as e:
-            print(f"Error listing templates: {e}")
+            self._record_error(f"Error listing templates: {e}")
             return []
 
     def get_template(self, template_id: str, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -700,7 +855,7 @@ class FirebaseClient:
             
             return None
         except Exception as e:
-            print(f"Error getting template: {e}")
+            self._record_error(f"Error getting template: {e}")
             return None
 
     def delete_template(self, template_id: str, user_id: str) -> bool:
@@ -721,7 +876,7 @@ class FirebaseClient:
             self._db.child("templates").child(user_id).child(template_id).remove()
             return True
         except Exception as e:
-            print(f"Error deleting template: {e}")
+            self._record_error(f"Error deleting template: {e}")
             return False
 
     def update_template(self, template_id: str, user_id: str, 
@@ -761,10 +916,19 @@ class FirebaseClient:
                     self._db.child("public_templates").child(template_id).remove()
             
             template_path.set(template_data)
+            self._record_error(None)
             return True, "Template updated successfully"
         except Exception as e:
-            print(f"Error updating template: {e}")
+            self._record_error(f"Error updating template: {e}")
             return False, f"Failed to update template: {str(e)}"
+
+    def _record_error(self, message: Optional[str]) -> None:
+        self._last_error = message
+
+    def pop_last_error(self) -> Optional[str]:
+        err = self._last_error
+        self._last_error = None
+        return err
 
 
 # ---------------------------------------------------------
@@ -780,6 +944,9 @@ def authenticate_with_google(*args, **kwargs): return client.authenticate_with_g
 def supports_google_auth(): return client.supports_google_auth()
 def get_google_auth_url(*args, **kwargs): return client.get_google_auth_url(*args, **kwargs)
 def exchange_code_for_token(*args, **kwargs): return client.exchange_code_for_token(*args, **kwargs)
+def create_persistent_session(*args, **kwargs): return client.create_persistent_session(*args, **kwargs)
+def resume_session(*args, **kwargs): return client.resume_session(*args, **kwargs)
+def delete_persistent_session(*args, **kwargs): return client.delete_persistent_session(*args, **kwargs)
 
 # Message and session wrappers
 def save_message(*args, **kwargs): return client.save_message(*args, **kwargs)
@@ -797,3 +964,4 @@ def update_template(*args, **kwargs): return client.update_template(*args, **kwa
 
 # Configuration check
 def is_configured(): return client.is_configured()
+def pop_last_error(): return client.pop_last_error()
